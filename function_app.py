@@ -3,15 +3,52 @@ import logging
 from psycopg_pool import ConnectionPool
 import json
 import os
+import datetime as dt
 
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 pool = ConnectionPool(conninfo=os.getenv("POSTGRES_URL"), min_size=1, max_size=5)
 
-@app.route(route="add_marker")
+@app.route(route="add_marker", methods=["POST"])
 def add_marker(req: func.HttpRequest) -> func.HttpResponse:
-    req_body = req.get_json()
+    try:
+        req_body = req.get_json()
+        meeting_id = req_body.get("meeting_id")
+        label = (req_body.get("label") or "").strip()
+
+        if not meeting_id:
+            return func.HttpResponse("Missing meeting_id", status_code=400)
+        
+        utc_timestamp = dt.datetime.now(dt.timezone.utc)
+
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM meetings WHERE id = %s", (meeting_id,))
+            cur.execute("""
+                INSERT INTO markers (meeting_id, label, created_at)
+                VALUES (%s, %s, %s)
+                RETURNING id, meeting_id, label, created_at
+            """, (meeting_id, label, utc_timestamp))
+            new_marker = cur.fetchone()
+            conn.commit()
+        
+        return func.HttpResponse(
+            json.dumps({
+                "id": new_marker[0],
+                "meeting_id": new_marker[1],
+                "label": new_marker[2],
+                "created_at": new_marker[3].isoformat(),
+                "utc_timestamp": utc_timestamp.isoformat()
+            }), status_code=201, mimetype="application/json")
+
+
+        
+
+
+
+        
+    except ValueError:
+        return func.HttpResponse("Invalid JSON", status_code=400)
     # logging.info('Python HTTP trigger function processed a request.')
 
     # name = req.params.get('name')
@@ -42,4 +79,9 @@ def db_check(req: func.HttpRequest) -> func.HttpResponse:
         cur.execute("SELECT count(*) FROM markers")
         markers = cur.fetchone()[0]
         logging.info(f"PostgreSQL version: {version}, meetings count: {meetings}, markers count: {markers}")
-    return func.HttpResponse("DB connection successful.")
+    return func.HttpResponse(
+        json.dumps({
+            "postgres_version": version,
+            "meetings_count": meetings,
+            "markers_count": markers
+        }), status_code=200, mimetype="application/json")
