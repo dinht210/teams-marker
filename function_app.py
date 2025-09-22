@@ -17,29 +17,37 @@ def add_marker(req: func.HttpRequest) -> func.HttpResponse:
         meeting_id = req_body.get("meeting_id")
         #meeting_id = req.params.get("meeting_id")
         label = (req_body.get("label") or "").strip()
+        dummy_user_id = req_body.get("dummy_user_id") # temporary until user auth is implemented
 
         if not meeting_id:
             return func.HttpResponse("Missing meeting_id", status_code=400)
+        if not dummy_user_id: # temp
+            return func.HttpResponse("dummy_user_id is required for now", status_code=400)
         
         utc_timestamp = dt.datetime.now(dt.timezone.utc)
 
         with pool.connection() as conn, conn.cursor() as cur:
-            cur.execute("SELECT id FROM meetings WHERE id = %s", (meeting_id,))
+            cur.execute("INSERT INTO meetings (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (meeting_id,))
             cur.execute("""
-                INSERT INTO markers (meeting_id, label, utc_timestamp)
-                VALUES (%s, %s, %s)
-                RETURNING id, meeting_id, label, utc_timestamp
-            """, (meeting_id, label, utc_timestamp))
-            new_marker = cur.fetchone()
+                INSERT INTO markers (meeting_id, label, utc_timestamp, user_id)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, meeting_id, label, utc_timestamp, user_id
+            """, (meeting_id, label, utc_timestamp, dummy_user_id))
+            new_marker = cur.fetchone() # fetched row of newly added marker
             conn.commit()
         
+        _id, meeting_id, label, utc_timestamp, user_id = new_marker
+
+        resp = {
+            "id": str(_id),
+            "meeting_id": meeting_id,
+            "label": label,
+            "utc_timestamp": utc_timestamp.isoformat(),
+            "user_id": str(user_id)
+        }
+        
         return func.HttpResponse(
-            json.dumps({
-                "id": new_marker[0],
-                "meeting_id": new_marker[1],
-                "label": new_marker[2],
-                "utc_timestamp": new_marker[3].isoformat()
-            }), status_code=201, mimetype="application/json")
+            json.dumps(resp), status_code=201, mimetype="application/json")
     except ValueError:
         return func.HttpResponse("Invalid JSON", status_code=400)
 
@@ -62,7 +70,7 @@ def get_markers(req: func.HttpRequest) -> func.HttpResponse:
 
         markers_list = [
             {
-                "id": row[0],
+                "id": str(row[0]),
                 "meeting_id": row[1],
                 "label": row[2],
                 "utc_timestamp": row[3].isoformat()
@@ -92,3 +100,4 @@ def db_check(req: func.HttpRequest) -> func.HttpResponse:
             "meetings_count": meetings,
             "markers_count": markers
         }), status_code=200, mimetype="application/json")
+
