@@ -4,6 +4,7 @@ from psycopg_pool import ConnectionPool
 import json
 import os
 import datetime as dt
+from shared.auth import validate_bearer
 
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -13,6 +14,8 @@ pool = ConnectionPool(conninfo=os.getenv("POSTGRES_URL"), min_size=1, max_size=5
 @app.route(route="add_marker", methods=["POST"])
 def add_marker(req: func.HttpRequest) -> func.HttpResponse:
     try:
+        #user = validate_bearer(req.headers.get("Authorization"))
+        #print("Authenticated user:", user)
         req_body = req.get_json()
         meeting_id = req_body.get("meeting_id")
         #meeting_id = req.params.get("meeting_id")
