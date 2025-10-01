@@ -37,3 +37,7 @@ def validate_bearer(auth_header: str) -> dict:
         raise ValueError("Token has expired")
     except jwt.InvalidTokenError as e:
         raise ValueError(f"Invalid token: {str(e)}")
+    
+#require user decorator 
+def require_user(func):
+    pass

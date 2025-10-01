@@ -5,6 +5,8 @@ import json
 import os
 import datetime as dt
 from shared.auth import validate_bearer
+import azurefunctions.extensions.bindings.servicebus as servicebus
+
 
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -103,4 +105,10 @@ def db_check(req: func.HttpRequest) -> func.HttpResponse:
             "meetings_count": meetings,
             "markers_count": markers
         }), status_code=200, mimetype="application/json")
+
+@app.service_bus_queue_trigger(arg_name="msg", queue_name="teams-marker-queue", connection="SERVICE_BUS_CONNECTION_STRING")
+def process_meeting(msg: func.ServiceBusReceivedMessage):
+    logging.info('Service Bus queue trigger function processed a message.')
+    logging.info(f'Message ID: {msg.message_id}')
+    logging.info(f'Message Body: {msg.get_body().decode("utf-8")}')
 
