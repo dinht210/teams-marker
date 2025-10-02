@@ -5,8 +5,8 @@ import json
 import os
 import datetime as dt
 from shared.auth import validate_bearer
-import azurefunctions.extensions.bindings.servicebus as servicebus
-
+from shared import graph
+import asyncio
 
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -106,9 +106,60 @@ def db_check(req: func.HttpRequest) -> func.HttpResponse:
             "markers_count": markers
         }), status_code=200, mimetype="application/json")
 
-@app.service_bus_queue_trigger(arg_name="msg", queue_name="teams-marker-queue", connection="SERVICE_BUS_CONNECTION_STRING")
-def process_meeting(msg: func.ServiceBusReceivedMessage):
-    logging.info('Service Bus queue trigger function processed a message.')
-    logging.info(f'Message ID: {msg.message_id}')
-    logging.info(f'Message Body: {msg.get_body().decode("utf-8")}')
+# @app.function_name(name="ServiceBusTopicTrigger1")
+@app.service_bus_queue_trigger(arg_name="message", 
+                               queue_name="teams-marker-queue", 
+                               connection="SERVICE_BUS_CONNECTION_STRING"
+                               )
+def test_function(message: func.ServiceBusMessage):
+    message_body = message.get_body().decode("utf-8")
+    logging.info("Python ServiceBus topic trigger processed message.")
+    logging.info("Message Body: " + message_body)
+
+
+# @app.service_bus_queue_trigger(arg_name="msg", queue_name="teams-marker-queue", connection="SERVICE_BUS_CONNECTION_STRING")
+# def process_meeting(msg: func.ServiceBusReceivedMessage):
+#     logging.info('Service Bus queue trigger function processed a message.')
+#     logging.info(f'Message ID: {msg.message_id}')
+#     logging.info(f'Message Body: {msg.get_body().decode("utf-8")}')
+
+#smoke testing graph functions
+@app.route(route="debug_fetch_artifacts", methods=["POST"])
+def debug_fetch_artifacts(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        req_body = req.get_json()
+        organizer_id = req_body.get("organizer_id")
+        meeting_id = req_body.get("online_meeting_id")
+        join_url = req_body.get("join_url")
+        #transcript_id = req_body.get("transcript_id")
+        #recording_id = req_body.get("recording_id")
+
+        if organizer_id is None:
+            return func.HttpResponse("No Organizer ID", status_code=400)
+        if meeting_id is None:
+            meeting_id = graph.resolve_meeting_by_join_url(join_web_url=join_url, organizer_id=organizer_id)
+            if meeting_id is None:
+                return func.HttpResponse("Cannot resolve meeting by join URL", status_code=400)
+
+        transcripts = graph.list_transcripts(organizer_id=organizer_id, online_meeting_id=meeting_id)
+        recordings = graph.list_recordings(organizer_id=organizer_id, online_meeting_id=meeting_id)
+
+        response = {
+            "online_meeting_id": meeting_id,
+            "transcripts_count": len(transcripts),
+            "recordings_count": len(recordings),
+            "transcripts": [
+                {k: t.get(k) for k in ("id", "createdDateTime", "lastModifiedDateTime")}
+                for t in transcripts
+            ],
+            "recordings": [
+                {k: r.get(k) for k in ("id", "createdDateTime", "contentCorrelationId")}
+                for r in recordings
+            ]
+        }
+
+        return func.HttpResponse(
+            json.dumps(response), status_code=200, mimetype="application/json")
+    except Exception as e:
+        return func.HttpResponse(f"Error = {e}", status_code=500)
 
