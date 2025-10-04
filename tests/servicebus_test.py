@@ -9,7 +9,8 @@ conn = os.environ["SERVICE_BUS_CONNECTION_STRING"]
 QUEUE_NAME = "teams-marker-queue"
 MEETING_ID = "MSpjMWMzZjMzMC0zZWNlLTQxOTQtODI4OC1jOGNjNGVlNzRiZWUqMCoqMTk6bWVldGluZ19OalEwTTJNMVl6UXRZbUk1WkMwMFlXVXpMVGhtTVdVdFptSmxOVFZoWXpoall6a3lAdGhyZWFkLnYy"
 ORGANIZER_ID = "c1c3f330-3ece-4194-8288-c8cc4ee74bee"
-TEST_MESSAGE = {"online_meeting_id": MEETING_ID, "organizer_id": ORGANIZER_ID}
+JOIN_URL = "https://teams.microsoft.com/l/meetup-join/19%3ameeting_MDhhMTkyNDQtZTdiNS00OTVmLTgwMjktYTMwNTMyYWRmMmE5%40thread.v2/0?context=%7b%22Tid%22%3a%22dba8614e-5825-4990-87e0-e392a37f09a4%22%2c%22Oid%22%3a%22c1c3f330-3ece-4194-8288-c8cc4ee74bee%22%7d"
+TEST_MESSAGE = {"join_url": JOIN_URL, "organizer_id": ORGANIZER_ID}
 
 with ServiceBusClient.from_connection_string(conn) as client:
     with client.get_queue_sender(queue_name=QUEUE_NAME) as sender:

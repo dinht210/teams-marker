@@ -88,7 +88,7 @@ def get_markers(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("Invalid JSON", status_code=400)
 
 @app.route(route="get_meetings", methods=["GET"])
-def get_meetings (req: func.HttpRequest) -> func.httpResponse:
+def get_meetings(req: func.HttpRequest) -> func.HttpResponse:
     try:
         req_body = req.get_json()
         meeting_id = req_body.get("meeting_id")
@@ -99,9 +99,9 @@ def get_meetings (req: func.HttpRequest) -> func.httpResponse:
             cur.execute("""
                 SELECT id, artifacts_ready, recording_start_utc, recording_base_url
                 FROM meetings
-                WHERE meeting_id = %s
+                WHERE id = %s
                 ORDER BY updated_at ASC
-            """, (meeting_id))
+            """, (meeting_id,))
             meetings = cur.fetchall()
         
         meetings_list = [
@@ -136,13 +136,14 @@ def db_check(req: func.HttpRequest) -> func.HttpResponse:
             "markers_count": markers
         }), status_code=200, mimetype="application/json")
 
-@app.service_bus_queue_trigger(arg_name="message", 
+@app.service_bus_queue_trigger(arg_name="msg", 
                                queue_name="teams-marker-queue", 
                                connection="SERVICE_BUS_CONNECTION_STRING")
 def process_meeting(msg: func.ServiceBusMessage):
     # logging.info('Service Bus queue trigger function processed a message.')
     # logging.info(f'Message ID: {msg.message_id}')
     # logging.info(f'Message Body: {msg.get_body().decode("utf-8")}')
+    print("ASDOIJQWOIEJIOQWJDIODMWQD")
     try:
         msg_body = json.loads(msg.get_body().decode("utf-8"))
         organizer_id = msg_body.get("organizer_id")
@@ -173,6 +174,10 @@ def process_meeting(msg: func.ServiceBusMessage):
         # );
 
         with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO meetings (id) VALUES (%s) ON CONFLICT (id) DO NOTHING",
+                (meeting_id,)
+            )
             cur.execute("""
                 UPDATE meetings
                 SET artifacts_ready = TRUE,
@@ -182,6 +187,7 @@ def process_meeting(msg: func.ServiceBusMessage):
                 WHERE id = %s
             """, (start_time_utc if recordings else None, base_url, meeting_id))
             conn.commit()
+            print("DONEOISNDAOS")
     except Exception as e:
         return func.HttpResponse(f"Error = {e}", status_code=500)
 
