@@ -7,7 +7,9 @@ load_dotenv()
 
 conn = os.environ["SERVICE_BUS_CONNECTION_STRING"]
 QUEUE_NAME = "teams-marker-queue"
-TEST_MESSAGE = {"meeting_id": "test-meeting-id", "marker_label": "Test Marker"}
+MEETING_ID = "MSpjMWMzZjMzMC0zZWNlLTQxOTQtODI4OC1jOGNjNGVlNzRiZWUqMCoqMTk6bWVldGluZ19OalEwTTJNMVl6UXRZbUk1WkMwMFlXVXpMVGhtTVdVdFptSmxOVFZoWXpoall6a3lAdGhyZWFkLnYy"
+ORGANIZER_ID = "c1c3f330-3ece-4194-8288-c8cc4ee74bee"
+TEST_MESSAGE = {"online_meeting_id": MEETING_ID, "organizer_id": ORGANIZER_ID}
 
 with ServiceBusClient.from_connection_string(conn) as client:
     with client.get_queue_sender(queue_name=QUEUE_NAME) as sender:

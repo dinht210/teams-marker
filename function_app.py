@@ -84,7 +84,37 @@ def get_markers(req: func.HttpRequest) -> func.HttpResponse:
 
         return func.HttpResponse(
             json.dumps(markers_list), status_code=200, mimetype="application/json")
+    except ValueError:
+        return func.HttpResponse("Invalid JSON", status_code=400)
 
+@app.route(route="get_meetings", methods=["GET"])
+def get_meetings (req: func.HttpRequest) -> func.httpResponse:
+    try:
+        req_body = req.get_json()
+        meeting_id = req_body.get("meeting_id")
+        if not meeting_id:
+            return func.HttpResponse("Missing meeting_id", status_code=400)
+
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, artifacts_ready, recording_start_utc, recording_base_url
+                FROM meetings
+                WHERE meeting_id = %s
+                ORDER BY updated_at ASC
+            """, (meeting_id))
+            meetings = cur.fetchall()
+        
+        meetings_list = [
+            {
+                "id": str(row[0]),
+                "artifacts_ready": row[1],
+                "recording_start_utc": row[2].isoformat(),
+                "recording_base_url": row[3]
+            } for row in meetings
+        ]
+
+        return func.HttpResponse(
+            json.dumps(meetings_list), status_code=200, mimetype="application/json")
     except ValueError:
         return func.HttpResponse("Invalid JSON", status_code=400)
 
@@ -106,22 +136,54 @@ def db_check(req: func.HttpRequest) -> func.HttpResponse:
             "markers_count": markers
         }), status_code=200, mimetype="application/json")
 
-# @app.function_name(name="ServiceBusTopicTrigger1")
 @app.service_bus_queue_trigger(arg_name="message", 
                                queue_name="teams-marker-queue", 
-                               connection="SERVICE_BUS_CONNECTION_STRING"
-                               )
-def test_function(message: func.ServiceBusMessage):
-    message_body = message.get_body().decode("utf-8")
-    logging.info("Python ServiceBus topic trigger processed message.")
-    logging.info("Message Body: " + message_body)
+                               connection="SERVICE_BUS_CONNECTION_STRING")
+def process_meeting(msg: func.ServiceBusMessage):
+    # logging.info('Service Bus queue trigger function processed a message.')
+    # logging.info(f'Message ID: {msg.message_id}')
+    # logging.info(f'Message Body: {msg.get_body().decode("utf-8")}')
+    try:
+        msg_body = json.loads(msg.get_body().decode("utf-8"))
+        organizer_id = msg_body.get("organizer_id")
+        meeting_id = msg_body.get("online_meeting_id")
+        join_url = msg_body.get("join_url")
+        #transcript_id = req_body.get("transcript_id")
+        #recording_id = req_body.get("recording_id")
 
+        if organizer_id is None:
+            return func.HttpResponse("No Organizer ID", status_code=400)
+        if meeting_id is None:
+            meeting_id = graph.resolve_meeting_by_join_url(join_web_url=join_url, organizer_id=organizer_id)
+            if meeting_id is None:
+                return func.HttpResponse("Cannot resolve meeting by join URL", status_code=400)
 
-# @app.service_bus_queue_trigger(arg_name="msg", queue_name="teams-marker-queue", connection="SERVICE_BUS_CONNECTION_STRING")
-# def process_meeting(msg: func.ServiceBusReceivedMessage):
-#     logging.info('Service Bus queue trigger function processed a message.')
-#     logging.info(f'Message ID: {msg.message_id}')
-#     logging.info(f'Message Body: {msg.get_body().decode("utf-8")}')
+        #transcripts = graph.list_transcripts(organizer_id=organizer_id, online_meeting_id=meeting_id)
+        recordings = graph.list_recordings(organizer_id=organizer_id, online_meeting_id=meeting_id)
+
+        base_url = f"/users/{organizer_id}/onlineMeetings/{meeting_id}"
+        start_time_utc = recordings[0]["createdDateTime"]
+
+        #   create table if not exists meetings (
+        #   id text primary key,                         
+        #   artifacts_ready boolean default false,
+        #   recording_start_utc timestamptz,        
+        #   recording_base_url text,                 
+        #   updated_at timestamptz default now()
+        # );
+
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                UPDATE meetings
+                SET artifacts_ready = TRUE,
+                    recording_start_utc = %s,
+                    recording_base_url = %s,
+                    updated_at = now()
+                WHERE id = %s
+            """, (start_time_utc if recordings else None, base_url, meeting_id))
+            conn.commit()
+    except Exception as e:
+        return func.HttpResponse(f"Error = {e}", status_code=500)
 
 #smoke testing graph functions
 @app.route(route="debug_fetch_artifacts", methods=["POST"])
