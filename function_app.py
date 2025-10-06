@@ -7,6 +7,7 @@ import datetime as dt
 from shared.auth import validate_bearer
 from shared import graph
 import asyncio
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
 
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -230,4 +231,19 @@ def debug_fetch_artifacts(req: func.HttpRequest) -> func.HttpResponse:
             json.dumps(response), status_code=200, mimetype="application/json")
     except Exception as e:
         return func.HttpResponse(f"Error = {e}", status_code=500)
+    
+def enqueue_sb(payload: dict):
+    conn = os.environ["SERVICE_BUS_CONNECTION_STRING"]
+    QUEUE_NAME = "teams-marker-queue"
+
+    with ServiceBusClient.from_connection_string(conn) as client:
+        with client.get_queue_sender(queue_name=QUEUE_NAME) as sender:
+            message = ServiceBusMessage(json.dumps(payload))
+            sender.send_messages(message)
+
+@app.route(route="graph_notifications", methods=["POST"])
+def graph_notifications(req: func.HttpRequest) -> func.HttpResponse:
+    pass
+
+
 
