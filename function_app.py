@@ -241,9 +241,41 @@ def enqueue_sb(payload: dict):
             message = ServiceBusMessage(json.dumps(payload))
             sender.send_messages(message)
 
+#webhook endpoint (notification url)
 @app.route(route="graph_notifications", methods=["POST"])
 def graph_notifications(req: func.HttpRequest) -> func.HttpResponse:
-    pass
+    token = req.body.get("validationToken")
+
+    if token:
+        return func.HttpResponse(status_code=200, mimetype="text/plain")
+    
+    try:
+        req_body = req.get_json()
+    except ValueError:
+        return func.HttpResponse("Invalid JSON", status_code=202)
+    
+    client_state_secret = os.getenv("GRAPH_SUBS_CLIENT_STATE")
+    for i in req_body.get("value", []):
+        if client_state_secret and client_state_secret != i.get("clientState"):
+            logging.warning("Mismatched client state secret, skipping")
+            continue
+
+        resource = i.get("resource", "")
+        parts = resource.split("/")
+        organizer_id = parts[2] if len(parts) >= 3 and parts[0] == "users" else None
+
+        if not organizer_id:
+            logging.warning("Unrecognized resource: %s", resource)
+            continue
+
+        payload = {
+            "organizer_id": organizer_id
+        }
+
+        enqueue_sb(payload)
+        logging.info("Webhook: enqueued organizer=%s", organizer_id)
+
+    return func.HttpResponse(status_code=202)
 
 
 
