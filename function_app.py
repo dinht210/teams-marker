@@ -141,54 +141,36 @@ def db_check(req: func.HttpRequest) -> func.HttpResponse:
                                queue_name="teams-marker-queue", 
                                connection="SERVICE_BUS_CONNECTION_STRING")
 def process_meeting(msg: func.ServiceBusMessage):
-    # logging.info('Service Bus queue trigger function processed a message.')
-    # logging.info(f'Message ID: {msg.message_id}')
-    # logging.info(f'Message Body: {msg.get_body().decode("utf-8")}')
-    print("ASDOIJQWOIEJIOQWJDIODMWQD")
     try:
         msg_body = json.loads(msg.get_body().decode("utf-8"))
         organizer_id = msg_body.get("organizer_id")
-        meeting_id = msg_body.get("online_meeting_id")
-        join_url = msg_body.get("join_url")
-        #transcript_id = req_body.get("transcript_id")
-        #recording_id = req_body.get("recording_id")
 
-        if organizer_id is None:
-            return func.HttpResponse("No Organizer ID", status_code=400)
-        if meeting_id is None:
-            meeting_id = graph.resolve_meeting_by_join_url(join_web_url=join_url, organizer_id=organizer_id)
-            if meeting_id is None:
-                return func.HttpResponse("Cannot resolve meeting by join URL", status_code=400)
+        if organizer_id:
+            touched = set()
+            for r in graph.get_all_recordings_for_organizer(organizer_id):
+                mid = r.get("meetingId")
+                if mid: 
+                    touched.add(mid)
+            for t in graph.get_all_transcripts_for_organizer(organizer_id):
+                mid = t.get("meetingId")
+                if mid: 
+                    touched.add(mid)
 
-        #transcripts = graph.list_transcripts(organizer_id=organizer_id, online_meeting_id=meeting_id)
-        recordings = graph.list_recordings(organizer_id=organizer_id, online_meeting_id=meeting_id)
-
-        base_url = f"/users/{organizer_id}/onlineMeetings/{meeting_id}"
-        start_time_utc = recordings[0]["createdDateTime"]
-
-        #   create table if not exists meetings (
-        #   id text primary key,                         
-        #   artifacts_ready boolean default false,
-        #   recording_start_utc timestamptz,        
-        #   recording_base_url text,                 
-        #   updated_at timestamptz default now()
-        # );
-
-        with pool.connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO meetings (id) VALUES (%s) ON CONFLICT (id) DO NOTHING",
-                (meeting_id,)
-            )
-            cur.execute("""
-                UPDATE meetings
-                SET artifacts_ready = TRUE,
-                    recording_start_utc = %s,
-                    recording_base_url = %s,
-                    updated_at = now()
-                WHERE id = %s
-            """, (start_time_utc if recordings else None, base_url, meeting_id))
-            conn.commit()
-            print("DONEOISNDAOS")
+            with pool.connection() as conn, conn.cursor() as cur:
+                for mid in touched:
+                    recs = graph.list_recordings(organizer_id, mid)
+                    start = recs[0].get("createdDateTime") if recs else None
+                    base  = f"/users/{organizer_id}/onlineMeetings/{mid}"
+                    cur.execute("INSERT INTO meetings (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (mid,))
+                    cur.execute("""
+                    UPDATE meetings
+                    SET artifacts_ready = TRUE,
+                        recording_start_utc = %s,
+                        recording_base_url = %s,
+                        updated_at = now()
+                    WHERE id = %s
+                    """, (start, base, mid))
+                conn.commit()
     except Exception as e:
         return func.HttpResponse(f"Error = {e}", status_code=500)
 
@@ -277,5 +259,60 @@ def graph_notifications(req: func.HttpRequest) -> func.HttpResponse:
 
     return func.HttpResponse(status_code=202)
 
+@app.route("create_subscriptions", methods=["POST"]) 
+def create_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        req_body = req.get_json()
+        organizer_id = req_body.get("organizer_id")
+        notification_url = os.getenv["GRAPH_NOTIF_URL"]
+        expiration = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=55)).replace(microsecond=0).isoformat() + "Z"
+        resources = ["/onlineMeetings/getAllRecordings", "onlineMeetings/getAllTranscripts"]
+        client_state = os.getenv["GRAPH_SUBS_CLIENT_STATE"]
 
+        for r in resources:
+            # body = {
+            #     "changeType": "created",
+            #     "notificationUrl": notification_url,
+            #     "resource": r,
+            #     "expirationDateTime": expiration,
+            #     "clientState": client_state
+            # }
+            sub = graph.create_subscription(
+                notiication_url=notification_url,
+                client_state=client_state,
+                organizer_id=organizer_id,
+                expiration_date=expiration,
+                resource=r
+            )
+            logging.info(f"Created subscription: {sub}")
+    except Exception as e:
+        return func.HttpResponse(f"Exception occured: {e}", status_code=400)
 
+# schedule param takes ncrontab expression
+@app.timer_trigger(
+        schedule="0 */30 * * * *", 
+        arg_name="mytimer",
+        use_monitor=True
+    )
+def renew_subscriptions(mytimer: func.TimerRequest) -> None:
+    try:
+        s = graph._http()
+        new_exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=55)).replace(microsecond=0).isoformat() + "Z"
+        subs = s.get(f"{graph.GRAPH_ENDPOINT}/subscriptions")
+        subs.raise_for_status()
+        for sub in subs.json().get("value", []):
+            if sub.get("notificationUrl") != os.getenv("GRAPH_NOTIF_URL"):
+                continue
+            if os.getenv("GRAPH_SUBS_CLIENT_STATE") and sub.get("clientState") != os.getenv("GRAPH_SUBS_CLIENT_STATE"):
+                continue
+
+            sub_id = sub.get("id")
+            patch_url = f"{graph.GRAPH_ENDPOINT}/subscriptions/{sub_id}"
+            resp = s.patch(patch_url, json={"expirationDateTime": new_exp_date}, timeout=30)
+            resp.raise_for_status()
+
+            logging.info(f"Renewed subscription {sub_id} to {new_exp_date}")
+    except Exception as e:
+        logging.error(f"Cannot get HTTP session: {e}")
+        return
+    
