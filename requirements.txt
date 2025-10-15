@@ -5,6 +5,7 @@
 azure-functions
 azure-identity
 azure-servicebus
+msal
 pyjwt[crypto]
 psycopg2-binary
 pydantic

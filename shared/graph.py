@@ -1,6 +1,7 @@
 import os
 import msal
 import requests
+import logging
 from urllib.parse import quote
 
 GRAPH_TENANT_ID = os.getenv("GRAPH_TENANT_ID")
@@ -99,15 +100,20 @@ def resolve_meeting_by_join_url(join_web_url: str, organizer_id: str):
     items = r.json().get("value", [])
     return items[0]["id"] if items else None
 
-def create_subscription(notiication_url: str, client_state: str, organizer_id: str, expiration_date: str, resource: str):
+def create_subscription(notification_url: str, client_state: str, organizer_id: str, expiration_date: str, resource: str):
     url = f"{GRAPH_ENDPOINT}/subscriptions"
     payload = {
         "changeType": "created",
-        "notificationUrl": notiication_url,
+        "notificationUrl": notification_url,
+        "lifecycleNotificationUrl": notification_url,
         "resource": f"users/{organizer_id}/{resource}",
         "expirationDateTime": expiration_date,
         "clientState": client_state
     }
-    response = _http().post(url, json=payload, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    print(_token)
+    ah = _http().headers.get("Authorization","")
+    logging.info("Auth header starts with: %r", ah[:12])  # should be 'Bearer eyJ'
+    r = _http().post(url, json=payload, timeout=30)
+    logging.info("Create sub status=%s body=%s", r.status_code, r.text if r.status_code>=400 else "<ok>")
+    r.raise_for_status()
+    return r.json()

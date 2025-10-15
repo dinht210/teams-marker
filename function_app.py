@@ -3,10 +3,12 @@ import logging
 from psycopg_pool import ConnectionPool
 import json
 import os
+import re
 import datetime as dt
 from shared.auth import validate_bearer
 from shared import graph
 import asyncio
+from urllib.parse import urlencode
 from azure.servicebus import ServiceBusClient, ServiceBusMessage
 
 
@@ -137,42 +139,76 @@ def db_check(req: func.HttpRequest) -> func.HttpResponse:
             "markers_count": markers
         }), status_code=200, mimetype="application/json")
 
+def parse_ce_resource(resource: str):
+    _RX_ITEM_USER = re.compile(
+        r"^users\('(?P<org>[^']+)'\)/onlineMeetings\('(?P<mid>[^']+)'\)/(?P<kind>recordings|transcripts)\('(?P<aid>[^']+)'\)$"
+    )
+
+    m = _RX_ITEM_USER.match(resource)
+    if m:
+        return {
+            "type": "item",
+            "organizer_id": m.group("org"),
+            "meeting_id": m.group("mid"),
+            "kind": m.group("kind"),
+            "artifact_id": m.group("aid"),
+        }
+    
+    return None
+
 @app.service_bus_queue_trigger(arg_name="msg", 
                                queue_name="teams-marker-queue", 
                                connection="SERVICE_BUS_CONNECTION_STRING")
 def process_meeting(msg: func.ServiceBusMessage):
-    try:
-        msg_body = json.loads(msg.get_body().decode("utf-8"))
-        organizer_id = msg_body.get("organizer_id")
+    msg_body = json.loads(msg.get_body().decode("utf-8"))
+    
+    if isinstance(msg_body, dict):
+        events = [msg_body]
+    
+    for event in events:
+        data = event.get("data", {})
 
-        if organizer_id:
-            touched = set()
-            for r in graph.get_all_recordings_for_organizer(organizer_id):
-                mid = r.get("meetingId")
-                if mid: 
-                    touched.add(mid)
-            for t in graph.get_all_transcripts_for_organizer(organizer_id):
-                mid = t.get("meetingId")
-                if mid: 
-                    touched.add(mid)
+        resource = data.get("resource", "")
+        parts = resource.split("/")
+        organizer_id = parts[2] if len(parts) >= 3 and parts[0] == "users" else None
 
-            with pool.connection() as conn, conn.cursor() as cur:
-                for mid in touched:
-                    recs = graph.list_recordings(organizer_id, mid)
-                    start = recs[0].get("createdDateTime") if recs else None
-                    base  = f"/users/{organizer_id}/onlineMeetings/{mid}"
-                    cur.execute("INSERT INTO meetings (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (mid,))
-                    cur.execute("""
-                    UPDATE meetings
-                    SET artifacts_ready = TRUE,
-                        recording_start_utc = %s,
-                        recording_base_url = %s,
-                        updated_at = now()
-                    WHERE id = %s
-                    """, (start, base, mid))
-                conn.commit()
-    except Exception as e:
-        return func.HttpResponse(f"Error = {e}", status_code=500)
+        if not organizer_id:
+            logging.warning("Unrecognized resource: %s", resource)
+            continue
+
+    logging.info("Processing organizer_id=%s", organizer_id)
+
+    touched = set()
+    for r in graph.get_all_recordings(organizer_id):
+        mid = r.get("meetingId")
+        if mid: 
+            touched.add(mid)
+    for t in graph.get_all_transcripts(organizer_id):
+        mid = t.get("meetingId")
+        if mid: 
+            touched.add(mid)
+
+    logging.info("Found %d meetings with new artifacts for organizer_id=%s", len(touched), organizer_id)
+    logging.info("Updating meetings in DB")
+
+    with pool.connection() as conn, conn.cursor() as cur:
+        for mid in touched:
+            logging.info("Updating meeting %s", mid)
+            recs = graph.list_recordings(organizer_id, mid)
+            start = recs[0].get("createdDateTime") if recs else None
+            base  = f"/users/{organizer_id}/onlineMeetings/{mid}"
+            cur.execute("INSERT INTO meetings (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (mid,))
+            cur.execute("""
+            UPDATE meetings
+            SET artifacts_ready = TRUE,
+                recording_start_utc = %s,
+                recording_base_url = %s,
+                updated_at = now()
+            WHERE id = %s
+            """, (start, base, mid))
+        conn.commit()
+
+    logging.info("Finished updating meetings in DB")
 
 #smoke testing graph functions
 @app.route(route="debug_fetch_artifacts", methods=["POST"])
@@ -215,7 +251,7 @@ def debug_fetch_artifacts(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(f"Error = {e}", status_code=500)
     
 def enqueue_sb(payload: dict):
-    conn = os.environ["SERVICE_BUS_CONNECTION_STRING"]
+    conn = os.getenv("SERVICE_BUS_CONNECTION_STRING")
     QUEUE_NAME = "teams-marker-queue"
 
     with ServiceBusClient.from_connection_string(conn) as client:
@@ -259,34 +295,69 @@ def graph_notifications(req: func.HttpRequest) -> func.HttpResponse:
 
     return func.HttpResponse(status_code=202)
 
-@app.route("create_subscriptions", methods=["POST"]) 
+def create_eventgrid_uri():
+    q = urlencode({
+        "azureSubscriptionId": os.environ["EG_SUBSCRIPTION_ID"],
+        "resourceGroup": os.environ["EG_RESOURCE_GROUP"],
+        "partnerTopic": os.environ["EG_PARTNER_TOPIC"],
+        "location": os.environ["EG_LOCATION"]
+    })
+    return f"EventGrid:?{q}"
+
+@app.route("create_subscriptions", methods=["POST"])
 def create_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        req_body = req.get_json()
-        organizer_id = req_body.get("organizer_id")
-        notification_url = os.getenv["GRAPH_NOTIF_URL"]
-        expiration = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=55)).replace(microsecond=0).isoformat() + "Z"
-        resources = ["/onlineMeetings/getAllRecordings", "onlineMeetings/getAllTranscripts"]
-        client_state = os.getenv["GRAPH_SUBS_CLIENT_STATE"]
+        event_grid_notif_url = create_eventgrid_uri()
+        exp_dt = dt.datetime.utcnow() + dt.timedelta(hours=23)
+        exp_date = exp_dt.replace(microsecond=0).isoformat() + "Z"
+        client_state = os.getenv("GRAPH_SUBS_CLIENT_STATE")
+        organizer_id = req.get_json().get("organizer_id")
+        #resources = [f"users/{organizer_id}/onlineMeetings/getAllRecordings", f"users/{organizer_id}/onlineMeetings/getAllTranscripts"]
+        resources = ["onlineMeetings/getAllRecordings", "onlineMeetings/getAllTranscripts"]
 
+        created = []
         for r in resources:
-            # body = {
-            #     "changeType": "created",
-            #     "notificationUrl": notification_url,
-            #     "resource": r,
-            #     "expirationDateTime": expiration,
-            #     "clientState": client_state
-            # }
-            sub = graph.create_subscription(
-                notiication_url=notification_url,
-                client_state=client_state,
-                organizer_id=organizer_id,
-                expiration_date=expiration,
-                resource=r
-            )
-            logging.info(f"Created subscription: {sub}")
+            sub = graph.create_subscription(notification_url=event_grid_notif_url,
+                                            client_state=client_state,
+                                            organizer_id=organizer_id,
+                                            expiration_date=exp_date,
+                                            resource=r)
+            logging.info("Created subscription: %s", sub)
+            created.append(sub)
+
+        return func.HttpResponse(json.dumps({"created": created}), status_code=201, mimetype="application/json")
     except Exception as e:
+        logging.exception("Error creating subscriptions")
         return func.HttpResponse(f"Exception occured: {e}", status_code=400)
+
+# @app.route("create_subscriptions", methods=["POST"]) 
+# def create_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
+#     try:
+#         req_body = req.get_json()
+#         organizer_id = req_body.get("organizer_id")
+#         notification_url = os.getenv["GRAPH_NOTIF_URL"]
+#         expiration = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=55)).replace(microsecond=0).isoformat() + "Z"
+#         resources = ["/onlineMeetings/getAllRecordings", "onlineMeetings/getAllTranscripts"]
+#         client_state = os.getenv["GRAPH_SUBS_CLIENT_STATE"]
+
+#         for r in resources:
+#             # body = {
+#             #     "changeType": "created",
+#             #     "notificationUrl": notification_url,
+#             #     "resource": r,
+#             #     "expirationDateTime": expiration,
+#             #     "clientState": client_state
+#             # }
+#             sub = graph.create_subscription(
+#                 notiication_url=notification_url,
+#                 client_state=client_state,
+#                 organizer_id=organizer_id,
+#                 expiration_date=expiration,
+#                 resource=r
+#             )
+#             logging.info(f"Created subscription: {sub}")
+#     except Exception as e:
+#         return func.HttpResponse(f"Exception occured: {e}", status_code=400)
 
 # schedule param takes ncrontab expression
 @app.timer_trigger(
@@ -300,8 +371,9 @@ def renew_subscriptions(mytimer: func.TimerRequest) -> None:
         new_exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=55)).replace(microsecond=0).isoformat() + "Z"
         subs = s.get(f"{graph.GRAPH_ENDPOINT}/subscriptions")
         subs.raise_for_status()
+        event_grid_notif_url = create_eventgrid_uri()
         for sub in subs.json().get("value", []):
-            if sub.get("notificationUrl") != os.getenv("GRAPH_NOTIF_URL"):
+            if sub.get("notificationUrl") != event_grid_notif_url:
                 continue
             if os.getenv("GRAPH_SUBS_CLIENT_STATE") and sub.get("clientState") != os.getenv("GRAPH_SUBS_CLIENT_STATE"):
                 continue
