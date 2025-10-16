@@ -112,8 +112,14 @@ def create_subscription(notification_url: str, client_state: str, organizer_id: 
     }
     print(_token)
     ah = _http().headers.get("Authorization","")
-    logging.info("Auth header starts with: %r", ah[:12])  # should be 'Bearer eyJ'
+    #logging.info("Auth header starts with: %r", ah[:12]) 
     r = _http().post(url, json=payload, timeout=30)
-    logging.info("Create sub status=%s body=%s", r.status_code, r.text if r.status_code>=400 else "<ok>")
+    #logging.info("Create sub status=%s body=%s", r.status_code, r.text if r.status_code>=400 else "<ok>")
     r.raise_for_status()
     return r.json()
+
+def list_subscriptions():
+    url = f"{GRAPH_ENDPOINT}/subscriptions"
+    r = _http().get(url, timeout=30)
+    r.raise_for_status()
+    return r.json().get("value", [])

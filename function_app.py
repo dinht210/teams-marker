@@ -160,55 +160,107 @@ def parse_ce_resource(resource: str):
                                queue_name="teams-marker-queue", 
                                connection="SERVICE_BUS_CONNECTION_STRING")
 def process_meeting(msg: func.ServiceBusMessage):
-    msg_body = json.loads(msg.get_body().decode("utf-8"))
-    
-    if isinstance(msg_body, dict):
-        events = [msg_body]
-    
-    for event in events:
-        data = event.get("data", {})
+    try:
+        raw = msg.get_body().decode("utf-8")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            logging.error("ServiceBus message not JSON: %r", raw[:200])
+            return
 
-        resource = data.get("resource", "")
-        parts = resource.split("/")
-        organizer_id = parts[2] if len(parts) >= 3 and parts[0] == "users" else None
+        if isinstance(payload, dict):
+            events = [payload]
+        else:
+            events = payload
 
-        if not organizer_id:
-            logging.warning("Unrecognized resource: %s", resource)
-            continue
+        per_item = []
+        per_org = set()
 
-    logging.info("Processing organizer_id=%s", organizer_id)
+        for ev in events:
+            data = ev.get("data", {}) if isinstance(ev, dict) else {}
+            resource = data.get("resource") or ev.get("subject")
+            if not resource:
+                logging.warning("Event without resource: %s", ev); continue
 
-    touched = set()
-    for r in graph.get_all_recordings(organizer_id):
-        mid = r.get("meetingId")
-        if mid: 
-            touched.add(mid)
-    for t in graph.get_all_transcripts(organizer_id):
-        mid = t.get("meetingId")
-        if mid: 
-            touched.add(mid)
+            ev_type = ev.get("type") or ev.get("eventType") or ""
+            if "LifecycleNotification" in ev_type:
+                # handle elsewhere for lifecycle driven renewals
+                continue
 
-    logging.info("Found %d meetings with new artifacts for organizer_id=%s", len(touched), organizer_id)
-    logging.info("Updating meetings in DB")
+            parsed = parse_ce_resource(resource)
+            if not parsed:
+                logging.warning("Unrecognized resource: %s", resource); continue
 
-    with pool.connection() as conn, conn.cursor() as cur:
-        for mid in touched:
-            logging.info("Updating meeting %s", mid)
-            recs = graph.list_recordings(organizer_id, mid)
-            start = recs[0].get("createdDateTime") if recs else None
-            base  = f"/users/{organizer_id}/onlineMeetings/{mid}"
-            cur.execute("INSERT INTO meetings (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (mid,))
-            cur.execute("""
-            UPDATE meetings
-            SET artifacts_ready = TRUE,
-                recording_start_utc = %s,
-                recording_base_url = %s,
-                updated_at = now()
-            WHERE id = %s
-            """, (start, base, mid))
-        conn.commit()
+            if parsed["type"] == "agg":
+                per_org.add(parsed["organizer_id"])
+            elif parsed["type"] == "item":
+                per_item.append((parsed["organizer_id"], parsed["meeting_id"], parsed["kind"]))
+                    
+            logging.info("EventGrid event: kind=%s organizer=%s meeting=%s", parsed.get("kind"), parsed.get("organizer_id"), parsed.get("meeting_id"))
 
-    logging.info("Finished updating meetings in DB")
+        # process per-item first (cheapest, already gives meeting_id)
+        if per_item:
+            with pool.connection() as conn, conn.cursor() as cur:
+                for organizer_id, meeting_id, kind in per_item:
+                    recs = graph.list_recordings(organizer_id, meeting_id) if kind == "recordings" else []
+                    start = recs[0].get("createdDateTime") if recs else None
+                    base  = f"/users/{organizer_id}/onlineMeetings/{meeting_id}"
+                    cur.execute("INSERT INTO meetings (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (meeting_id,))
+                    cur.execute("""
+                        UPDATE meetings
+                        SET artifacts_ready = TRUE,
+                            recording_start_utc = %s,
+                            recording_base_url  = %s,
+                            updated_at          = now()
+                        WHERE id = %s
+                    """, (start, base, meeting_id))
+                conn.commit()
+
+        # for organizers that sent aggregator events, discover which meetings to upsert
+        for organizer_id in per_org:
+            touched = set()
+            try:
+                for r in graph.get_all_recordings(organizer_id):
+                    meeting_id = r.get("meetingId")
+                    touched.add(meeting_id) if meeting_id else None
+            except Exception:
+                logging.exception("getAllRecordings failed org=%s", organizer_id)
+            try:
+                for t in graph.get_all_transcripts(organizer_id):
+                    meeting_id = t.get("meetingId")
+                    touched.add(meeting_id) if meeting_id else None
+            except Exception:
+                logging.exception("getAllTranscripts failed org=%s", organizer_id)
+
+            if not touched:
+                continue
+
+            with pool.connection() as conn, conn.cursor() as cur:
+                for meeting_id in touched:
+                    try:
+                        recs = graph.list_recordings(organizer_id, meeting_id)
+                    except Exception:
+                        logging.exception("list_recordings failed org=%s mid=%s", organizer_id, meeting_id)
+                        recs = []
+                    start = recs[0].get("createdDateTime") if recs else None
+                    base  = f"/users/{organizer_id}/onlineMeetings/{meeting_id}"
+                    logging.info("Upserting meeting=%s start=%s base=%s", meeting_id, start, base)
+                    cur.execute("INSERT INTO meetings (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (meeting_id,))
+                    cur.execute("""
+                        UPDATE meetings
+                        SET artifacts_ready = TRUE,
+                            recording_start_utc = %s,
+                            recording_base_url  = %s,
+                            updated_at          = now()
+                        WHERE id = %s
+                    """, (start, base, meeting_id))
+                conn.commit()
+
+        logging.info("process_meeting: items=%d organizers=%d", len(per_item), len(per_org))
+
+    except Exception:
+        logging.exception("process_meeting failed")
+        raise 
 
 #smoke testing graph functions
 @app.route(route="debug_fetch_artifacts", methods=["POST"])
@@ -361,14 +413,14 @@ def create_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
 
 # schedule param takes ncrontab expression
 @app.timer_trigger(
-        schedule="0 */30 * * * *", 
+        schedule="0 0 */22 * * *", 
         arg_name="mytimer",
         use_monitor=True
     )
 def renew_subscriptions(mytimer: func.TimerRequest) -> None:
     try:
         s = graph._http()
-        new_exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=55)).replace(microsecond=0).isoformat() + "Z"
+        new_exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)).replace(microsecond=0).isoformat() + "Z"
         subs = s.get(f"{graph.GRAPH_ENDPOINT}/subscriptions")
         subs.raise_for_status()
         event_grid_notif_url = create_eventgrid_uri()
@@ -387,4 +439,13 @@ def renew_subscriptions(mytimer: func.TimerRequest) -> None:
     except Exception as e:
         logging.error(f"Cannot get HTTP session: {e}")
         return
+
+@app.route(route="list_subscriptions", methods=["GET"])
+def list_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        subs = graph.list_subscriptions()
+        return func.HttpResponse(json.dumps({"subscriptions": subs}), status_code=200, mimetype="application/json")
+    except Exception as e:
+        logging.error(f"Cannot get HTTP session: {e}")
+        return func.HttpResponse(f"Cannot list subscriptions: {e}", status_code=500)
     
