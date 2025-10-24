@@ -7,8 +7,8 @@ azure-identity
 azure-servicebus
 msal
 pyjwt[crypto]
-psycopg2-binary
 pydantic
 requests
 python-dotenv
-psycopg[pool]
+psycopg[binary,pool]
+urllib3

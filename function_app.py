@@ -1,20 +1,46 @@
 import azure.functions as func
 import logging
-from psycopg_pool import ConnectionPool
 import json
 import os
 import re
 import datetime as dt
-from shared.auth import validate_bearer
-from shared import graph
 import asyncio
 from urllib.parse import urlencode
-from azure.servicebus import ServiceBusClient, ServiceBusMessage
+# heavy imports
+# from shared.auth import validate_bearer
+# from shared import graph
+# from azure.servicebus import ServiceBusClient, ServiceBusMessage
+# from psycopg_pool import ConnectionPool
 
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
-pool = ConnectionPool(conninfo=os.getenv("POSTGRES_URL"), min_size=1, max_size=5)
+#pool = ConnectionPool(conninfo=os.getenv("POSTGRES_URL"), min_size=1, max_size=5)
+_pool = None
+def get_pool():
+    """Create the psycopg pool lazily to avoid blocking module import."""
+    global _pool
+    if _pool is None:
+        from psycopg_pool import ConnectionPool  # import here to avoid startup failures
+        conninfo = os.getenv("POSTGRES_URL")
+        # Fail fast with a clear error instead of hanging
+        if not conninfo:
+            raise RuntimeError("POSTGRES_URL is not set")
+        _pool = ConnectionPool(
+            conninfo=conninfo,
+            min_size=1,
+            max_size=5,
+            # don't attempt to open connections at construction time
+            open=False,
+            kwargs={"connect_timeout": 5}
+        )
+    return _pool
+
+
+@app.function_name(name="ping")
+@app.route(route="ping", methods=["GET"])
+def ping(req: func.HttpRequest) -> func.HttpResponse:
+    return func.HttpResponse("ok")
 
 @app.route(route="add_marker", methods=["POST"])
 def add_marker(req: func.HttpRequest) -> func.HttpResponse:
@@ -34,6 +60,7 @@ def add_marker(req: func.HttpRequest) -> func.HttpResponse:
         
         utc_timestamp = dt.datetime.now(dt.timezone.utc)
 
+        pool = get_pool()
         with pool.connection() as conn, conn.cursor() as cur:
             cur.execute("INSERT INTO meetings (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (meeting_id,))
             cur.execute("""
@@ -67,6 +94,7 @@ def get_markers(req: func.HttpRequest) -> func.HttpResponse:
         if not meeting_id:
             return func.HttpResponse("Missing meeting_id", status_code=400)
         
+        pool = get_pool()
         with pool.connection() as conn, conn.cursor() as cur:
             cur.execute("""
                 SELECT id, meeting_id, label, utc_timestamp
@@ -98,6 +126,7 @@ def get_meetings(req: func.HttpRequest) -> func.HttpResponse:
         if not meeting_id:
             return func.HttpResponse("Missing meeting_id", status_code=400)
 
+        pool = get_pool()
         with pool.connection() as conn, conn.cursor() as cur:
             cur.execute("""
                 SELECT id, artifacts_ready, recording_start_utc, recording_base_url
@@ -123,6 +152,7 @@ def get_meetings(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="db_check", methods=["GET"])
 def db_check(req: func.HttpRequest) -> func.HttpResponse:
+    pool = get_pool()
     logging.info('DB check function processing a request.')
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute("SELECT version();")
@@ -161,6 +191,7 @@ def parse_ce_resource(resource: str):
                                connection="SERVICE_BUS_CONNECTION_STRING")
 def process_meeting(msg: func.ServiceBusMessage):
     try:
+        from shared import graph
         raw = msg.get_body().decode("utf-8")
         try:
             payload = json.loads(raw)
@@ -183,9 +214,50 @@ def process_meeting(msg: func.ServiceBusMessage):
                 logging.warning("Event without resource: %s", ev); continue
 
             ev_type = ev.get("type") or ev.get("eventType") or ""
+
+            # filters lifecycle notifications
             if "LifecycleNotification" in ev_type:
-                # handle elsewhere for lifecycle driven renewals
-                continue
+                lifecycle = data.get("lifecycleEvent")
+                subscription_id = data.get("subscriptionId")
+                client_state = data.get("clientState")
+
+                if os.getenv("GRAPH_SUBS_CLIENT_STATE") and client_state != os.getenv("GRAPH_SUBS_CLIENT_STATE"):
+                    logging.warning("Mismatched client state secret, skipping")
+                    continue
+                
+                try:
+                    if lifecycle == "reauthorizationRequired":
+                        # graph.reauthorize_subscription(subscription_id)
+                        new_exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)).replace(microsecond=0).isoformat() + "Z"
+                        graph.renew_subscription(subscription_id, new_exp_date)
+
+                    elif lifecycle == "subscriptionRemoved":
+                        organizer_id = os.getenv("ORGANIZER_ID")
+                        if organizer_id:
+                            recreate_subsriptions(organizer_id)
+                        else:
+                            logging.warning("ORGANIZER_ID not set, cannot recreate subscriptions")
+
+                    elif lifecycle == "missed":
+                        subs = graph.list_subscriptions()
+                        for sub in subs:
+                            exp_time_str = sub.get("expirationDateTime")
+                            sub_id = sub.get("id")
+                            if not exp_time_str or not sub_id:
+                                continue
+                            exp_time_dt = dt.datetime.fromisoformat(exp_time_str.replace("Z", "+00:00"))
+                            time_diff = exp_time_dt - dt.datetime.now(dt.timezone.utc)
+                            # if expiring within an hour and we get a missed notification, renew
+                            if time_diff < dt.timedelta(hours=1):
+                                new_exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)).replace(microsecond=0).isoformat() + "Z"
+                                graph.renew_subscription(sub_id, new_exp_date)
+                    
+                    else:
+                        logging.info("Unhandled lifecycle event: %s", lifecycle)
+                except Exception:
+                    logging.exception("Error handling lifecycle event: %s", lifecycle)
+
+                return  # lifecycle events don't need further processing
 
             parsed = parse_ce_resource(resource)
             if not parsed:
@@ -200,6 +272,7 @@ def process_meeting(msg: func.ServiceBusMessage):
 
         # process per-item first (cheapest, already gives meeting_id)
         if per_item:
+            pool = get_pool()
             with pool.connection() as conn, conn.cursor() as cur:
                 for organizer_id, meeting_id, kind in per_item:
                     recs = graph.list_recordings(organizer_id, meeting_id) if kind == "recordings" else []
@@ -266,6 +339,7 @@ def process_meeting(msg: func.ServiceBusMessage):
 @app.route(route="debug_fetch_artifacts", methods=["POST"])
 def debug_fetch_artifacts(req: func.HttpRequest) -> func.HttpResponse:
     try:
+        from shared import graph
         req_body = req.get_json()
         organizer_id = req_body.get("organizer_id")
         meeting_id = req_body.get("online_meeting_id")
@@ -303,6 +377,7 @@ def debug_fetch_artifacts(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(f"Error = {e}", status_code=500)
     
 def enqueue_sb(payload: dict):
+    from azure.servicebus import ServiceBusClient, ServiceBusMessage
     conn = os.getenv("SERVICE_BUS_CONNECTION_STRING")
     QUEUE_NAME = "teams-marker-queue"
 
@@ -359,8 +434,9 @@ def create_eventgrid_uri():
 @app.route("create_subscriptions", methods=["POST"])
 def create_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
     try:
+        from shared import graph
         event_grid_notif_url = create_eventgrid_uri()
-        exp_dt = dt.datetime.utcnow() + dt.timedelta(hours=23)
+        exp_dt = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)
         exp_date = exp_dt.replace(microsecond=0).isoformat() + "Z"
         client_state = os.getenv("GRAPH_SUBS_CLIENT_STATE")
         organizer_id = req.get_json().get("organizer_id")
@@ -381,6 +457,26 @@ def create_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.exception("Error creating subscriptions")
         return func.HttpResponse(f"Exception occured: {e}", status_code=400)
+    
+def recreate_subsriptions(organizer_id: str):
+    try:
+        from shared import graph
+        event_grid_notif_url = create_eventgrid_uri()
+        exp_dt = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)
+        exp_date = exp_dt.replace(microsecond=0).isoformat() + "Z"
+        client_state = os.getenv("GRAPH_SUBS_CLIENT_STATE")
+        resources = ["onlineMeetings/getAllRecordings", "onlineMeetings/getAllTransripts"]
+
+        for r in resources:
+            sub = graph.create_subscription(notification_url=event_grid_notif_url,
+                                            client_state=client_state,
+                                            organizer_id=organizer_id,
+                                            expiration_date=exp_date,
+                                            resource=r)
+            logging.info("Created subscription: %s", sub)
+    except Exception as e:
+        logging.exception("Error recreating subscriptions for organizer %s", organizer_id)
+
 
 # @app.route("create_subscriptions", methods=["POST"]) 
 # def create_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
@@ -412,37 +508,39 @@ def create_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
 #         return func.HttpResponse(f"Exception occured: {e}", status_code=400)
 
 # schedule param takes ncrontab expression
-@app.timer_trigger(
-        schedule="0 0 */22 * * *", 
-        arg_name="mytimer",
-        use_monitor=True
-    )
-def renew_subscriptions(mytimer: func.TimerRequest) -> None:
-    try:
-        s = graph._http()
-        new_exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)).replace(microsecond=0).isoformat() + "Z"
-        subs = s.get(f"{graph.GRAPH_ENDPOINT}/subscriptions")
-        subs.raise_for_status()
-        event_grid_notif_url = create_eventgrid_uri()
-        for sub in subs.json().get("value", []):
-            if sub.get("notificationUrl") != event_grid_notif_url:
-                continue
-            if os.getenv("GRAPH_SUBS_CLIENT_STATE") and sub.get("clientState") != os.getenv("GRAPH_SUBS_CLIENT_STATE"):
-                continue
+# @app.timer_trigger(
+#         schedule="0 */6 * * * *", 
+#         arg_name="mytimer",
+#         use_monitor=True
+#     )
+# def renew_subscriptions(mytimer: func.TimerRequest) -> None:
+#     try:
+#         from shared import graph
+#         s = graph._http()
+#         new_exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)).replace(microsecond=0).isoformat() + "Z"
+#         subs = s.get(f"{graph.GRAPH_ENDPOINT}/subscriptions")
+#         subs.raise_for_status()
+#         event_grid_notif_url = create_eventgrid_uri()
+#         for sub in subs.json().get("value", []):
+#             if sub.get("notificationUrl") != event_grid_notif_url:
+#                 continue
+#             if os.getenv("GRAPH_SUBS_CLIENT_STATE") and sub.get("clientState") != os.getenv("GRAPH_SUBS_CLIENT_STATE"):
+#                 continue
 
-            sub_id = sub.get("id")
-            patch_url = f"{graph.GRAPH_ENDPOINT}/subscriptions/{sub_id}"
-            resp = s.patch(patch_url, json={"expirationDateTime": new_exp_date}, timeout=30)
-            resp.raise_for_status()
+#             sub_id = sub.get("id")
+#             patch_url = f"{graph.GRAPH_ENDPOINT}/subscriptions/{sub_id}"
+#             resp = s.patch(patch_url, json={"expirationDateTime": new_exp_date}, timeout=30)
+#             resp.raise_for_status()
 
-            logging.info(f"Renewed subscription {sub_id} to {new_exp_date}")
-    except Exception as e:
-        logging.error(f"Cannot get HTTP session: {e}")
-        return
+#             logging.info(f"Renewed subscription {sub_id} to {new_exp_date}")
+#     except Exception as e:
+#         logging.error(f"Cannot get HTTP session: {e}")
+#         return
 
 @app.route(route="list_subscriptions", methods=["GET"])
 def list_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
     try:
+        from shared import graph
         subs = graph.list_subscriptions()
         return func.HttpResponse(json.dumps({"subscriptions": subs}), status_code=200, mimetype="application/json")
     except Exception as e:

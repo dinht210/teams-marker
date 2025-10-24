@@ -123,3 +123,23 @@ def list_subscriptions():
     r = _http().get(url, timeout=30)
     r.raise_for_status()
     return r.json().get("value", [])
+
+def reauthorize_subscription(subscription_id: str):
+    url = f"{GRAPH_ENDPOINT}/subscriptions/{subscription_id}/reauthorize"
+    r = _http().post(url, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def renew_subscription(subscription_id: str, new_expiration_date: str):
+    url = f"{GRAPH_ENDPOINT}/subscriptions/{subscription_id}"
+    payload = {
+        "expirationDateTime": new_expiration_date
+    }
+    r = _http().patch(url, json=payload, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def delete_subscription(subscription_id: str):
+    url = f"{GRAPH_ENDPOINT}/subscriptions/{subscription_id}"
+    r = _http().delete(url, timeout=30)
+    r.raise_for_status()
