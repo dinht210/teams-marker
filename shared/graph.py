@@ -106,15 +106,19 @@ def create_subscription(notification_url: str, client_state: str, organizer_id: 
         "changeType": "created",
         "notificationUrl": notification_url,
         "lifecycleNotificationUrl": notification_url,
-        "resource": f"users/{organizer_id}/{resource}",
+        "resource": f"communications/{resource}",
         "expirationDateTime": expiration_date,
         "clientState": client_state
     }
-    print(_token)
+    #print("Creating subscription with payload:", payload)
+    #print(_token)
     ah = _http().headers.get("Authorization","")
     #logging.info("Auth header starts with: %r", ah[:12]) 
     r = _http().post(url, json=payload, timeout=30)
     #logging.info("Create sub status=%s body=%s", r.status_code, r.text if r.status_code>=400 else "<ok>")
+    if r.status_code >= 400:
+        logging.error("Graph create_subscription failed: %s\n%s",
+                    r.status_code, r.text)
     r.raise_for_status()
     return r.json()
 

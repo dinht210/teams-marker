@@ -424,9 +424,9 @@ def graph_notifications(req: func.HttpRequest) -> func.HttpResponse:
 
 def create_eventgrid_uri():
     q = urlencode({
-        "azureSubscriptionId": os.environ["EG_SUBSCRIPTION_ID"],
-        "resourceGroup": os.environ["EG_RESOURCE_GROUP"],
-        "partnerTopic": os.environ["EG_PARTNER_TOPIC"],
+        "azuresubscriptionid": os.environ["EG_SUBSCRIPTION_ID"],
+        "resourcegroup": os.environ["EG_RESOURCE_GROUP"],
+        "partnertopic": os.environ["EG_PARTNER_TOPIC"],
         "location": os.environ["EG_LOCATION"]
     })
     return f"EventGrid:?{q}"
@@ -436,8 +436,8 @@ def create_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
     try:
         from shared import graph
         event_grid_notif_url = create_eventgrid_uri()
-        exp_dt = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)
-        exp_date = exp_dt.replace(microsecond=0).isoformat() + "Z"
+        print("Event Grid notification URL:", event_grid_notif_url)
+        exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)).replace(microsecond=0).isoformat()
         client_state = os.getenv("GRAPH_SUBS_CLIENT_STATE")
         organizer_id = req.get_json().get("organizer_id")
         #resources = [f"users/{organizer_id}/onlineMeetings/getAllRecordings", f"users/{organizer_id}/onlineMeetings/getAllTranscripts"]
