@@ -11,23 +11,32 @@ MEETING_ID = "MSpjMWMzZjMzMC0zZWNlLTQxOTQtODI4OC1jOGNjNGVlNzRiZWUqMCoqMTk6bWVldG
 ORGANIZER_ID = "c1c3f330-3ece-4194-8288-c8cc4ee74bee"
 JOIN_URL = "https://teams.microsoft.com/l/meetup-join/19%3ameeting_MDhhMTkyNDQtZTdiNS00OTVmLTgwMjktYTMwNTMyYWRmMmE5%40thread.v2/0?context=%7b%22Tid%22%3a%22dba8614e-5825-4990-87e0-e392a37f09a4%22%2c%22Oid%22%3a%22c1c3f330-3ece-4194-8288-c8cc4ee74bee%22%7d"
 #TEST_MESSAGE = {"join_url": JOIN_URL, "organizer_id": ORGANIZER_ID}
-TEST_MESSAGE = {
+TEST_MESSAGE_LIFE = {
   "id": "test-evt-001",
   "eventType": "Microsoft.Graph.LifecycleNotification",
-  "subject": "/subscriptions/<subId>",
+  "subject": "/subscriptions/13532635-6ca2-4a61-816b-ff961f0d4a41",
   "eventTime": "2025-10-24T01:00:00Z",
   "dataVersion": "1.0",
   "metadataVersion": "1",
   "data": {
-    "subscriptionId": "<REAL_SUBSCRIPTION_ID_OR_FAKE_FOR_NEGATIVE_TEST>",
-    "clientState": "<YOUR_GRAPH_SUBS_CLIENT_STATE>",
+    "subscriptionId": "13532635-6ca2-4a61-816b-ff961f0d4a41",
+    "clientState": "supersecretgraphsubscriptionclientstate",
     "lifecycleEvent": "reauthorizationRequired"
   },
-  "topic": "/subscriptions/<azureSubId>/resourceGroups/<rg>/providers/Microsoft.EventGrid/partnerTopics/<topicName>"
+  "topic": "/subscriptions/13532635-6ca2-4a61-816b-ff961f0d4a41/resourceGroups/teams-marker-rsgrp/providers/Microsoft.EventGrid/partnerTopics/teamsmarker-topic"
+}
+TEST_MESSAGE_CHANGE = {
+    "id": "test-evt-002",
+    "eventType": "Microsoft.Graph.ChangeNotification",
+    "data": {
+        "subscriptionId": "13532635-6ca2-4a61-816b-ff961f0d4a41",
+        "clientState": "supersecretgraphsubscriptionclientstate",
+        "changeType": "created"
+    },
 }
 
 with ServiceBusClient.from_connection_string(conn) as client:
     with client.get_queue_sender(queue_name=QUEUE_NAME) as sender:
-        message = ServiceBusMessage(json.dumps(TEST_MESSAGE))
+        message = ServiceBusMessage(json.dumps(TEST_MESSAGE_LIFE))
         sender.send_messages(message)
 print("Test message sent to Service Bus queue.")

@@ -139,7 +139,12 @@ def renew_subscription(subscription_id: str, new_expiration_date: str):
     payload = {
         "expirationDateTime": new_expiration_date
     }
+    print(type(new_expiration_date))
+    print("Renewing subscription with payload:", payload)
     r = _http().patch(url, json=payload, timeout=30)
+    if r.status_code >= 400:
+        logging.error("Graph renew_subscription failed: %s\n%s",
+                    r.status_code, r.text)
     r.raise_for_status()
     return r.json()
 

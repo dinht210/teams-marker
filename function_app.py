@@ -31,7 +31,7 @@ def get_pool():
             min_size=1,
             max_size=5,
             # don't attempt to open connections at construction time
-            open=False,
+            wait=True,
             kwargs={"connect_timeout": 5}
         )
     return _pool
@@ -208,15 +208,17 @@ def process_meeting(msg: func.ServiceBusMessage):
         per_org = set()
 
         for ev in events:
+            logging.info("Processing event: %r", ev)
             data = ev.get("data", {}) if isinstance(ev, dict) else {}
             resource = data.get("resource") or ev.get("subject")
-            if not resource:
-                logging.warning("Event without resource: %s", ev); continue
-
             ev_type = ev.get("type") or ev.get("eventType") or ""
+            logging.info("EG evt id=%s type=%s keys=%s", ev.get("id"), ev_type, list(data.keys()))
+            # if not resource:
+            #     logging.warning("Event without resource: %s", ev); continue
 
             # filters lifecycle notifications
-            if "LifecycleNotification" in ev_type:
+            if "LifecycleNotification" in ev_type or data.get("lifecycleEvent") is not None:
+                logging.info("LIFECYCLE EVENT RECEIVED")
                 lifecycle = data.get("lifecycleEvent")
                 subscription_id = data.get("subscriptionId")
                 client_state = data.get("clientState")
@@ -228,13 +230,14 @@ def process_meeting(msg: func.ServiceBusMessage):
                 try:
                     if lifecycle == "reauthorizationRequired":
                         # graph.reauthorize_subscription(subscription_id)
-                        new_exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)).replace(microsecond=0).isoformat() + "Z"
+                        new_exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23))
+                        new_exp_date = new_exp_date.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
                         graph.renew_subscription(subscription_id, new_exp_date)
 
                     elif lifecycle == "subscriptionRemoved":
                         organizer_id = os.getenv("ORGANIZER_ID")
                         if organizer_id:
-                            recreate_subsriptions(organizer_id)
+                            recreate_subscriptions(organizer_id)
                         else:
                             logging.warning("ORGANIZER_ID not set, cannot recreate subscriptions")
 
@@ -249,7 +252,8 @@ def process_meeting(msg: func.ServiceBusMessage):
                             time_diff = exp_time_dt - dt.datetime.now(dt.timezone.utc)
                             # if expiring within an hour and we get a missed notification, renew
                             if time_diff < dt.timedelta(hours=1):
-                                new_exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)).replace(microsecond=0).isoformat() + "Z"
+                                new_exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23))
+                                new_exp_date = new_exp_date.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
                                 graph.renew_subscription(sub_id, new_exp_date)
                     
                     else:
@@ -257,8 +261,10 @@ def process_meeting(msg: func.ServiceBusMessage):
                 except Exception:
                     logging.exception("Error handling lifecycle event: %s", lifecycle)
 
+                logging.info("Lifecycle event processed: %s", lifecycle)
                 return  # lifecycle events don't need further processing
-
+            
+            logging.info("CHANGE NOTIFICATION DETECTED")
             parsed = parse_ce_resource(resource)
             if not parsed:
                 logging.warning("Unrecognized resource: %s", resource); continue
@@ -437,7 +443,7 @@ def create_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
         from shared import graph
         event_grid_notif_url = create_eventgrid_uri()
         print("Event Grid notification URL:", event_grid_notif_url)
-        exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=23)).replace(microsecond=0).isoformat()
+        exp_date = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=45)).replace(microsecond=0).isoformat()
         client_state = os.getenv("GRAPH_SUBS_CLIENT_STATE")
         organizer_id = req.get_json().get("organizer_id")
         #resources = [f"users/{organizer_id}/onlineMeetings/getAllRecordings", f"users/{organizer_id}/onlineMeetings/getAllTranscripts"]
@@ -458,7 +464,7 @@ def create_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
         logging.exception("Error creating subscriptions")
         return func.HttpResponse(f"Exception occured: {e}", status_code=400)
     
-def recreate_subsriptions(organizer_id: str):
+def recreate_subscriptions(organizer_id: str):
     try:
         from shared import graph
         event_grid_notif_url = create_eventgrid_uri()
@@ -546,4 +552,19 @@ def list_subscriptions(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.error(f"Cannot get HTTP session: {e}")
         return func.HttpResponse(f"Cannot list subscriptions: {e}", status_code=500)
+    
+@app.route(route="delete_subscription", methods=["POST"])
+def delete_subscription(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        from shared import graph
+        req_body = req.get_json()
+        subscription_id = req_body.get("subscription_id")
+        if not subscription_id:
+            return func.HttpResponse("Missing subscription_id", status_code=400)
+        
+        graph.delete_subscription(subscription_id)
+        return func.HttpResponse(f"Deleted subscription {subscription_id}", status_code=200)
+    except Exception as e:
+        logging.error(f"Cannot delete subscription: {e}")
+        return func.HttpResponse(f"Cannot delete subscription: {e}", status_code=500)
     
